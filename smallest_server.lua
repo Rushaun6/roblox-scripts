@@ -1,124 +1,111 @@
---[[
-SETUP (in Roblox Studio):
-1. Put PART 1 in a Script inside ServerScriptService.
-2. Put PART 2 in a LocalScript inside StarterGui.
-3. Publish the game. Teleporting only works in a published game,
-   not in Studio's play test.
-]]
+-- Smallest Server Joiner
+-- Client-side script (run via an executor). Works in most public Roblox games.
+-- Finds the public server with the fewest players and teleports you into it.
 
-------------------------------------------------------------
--- PART 1: Script (ServerScriptService)
-------------------------------------------------------------
-local MemoryStoreService = game:GetService("MemoryStoreService")
-local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
 
-local serverMap = MemoryStoreService:GetSortedMap("ActiveServers")
+local placeId = game.PlaceId
+local currentJob = game.JobId
+local player = Players.LocalPlayer
 
-local remote = Instance.new("RemoteEvent")
-remote.Name = "JoinSmallestEvent"
-remote.Parent = ReplicatedStorage
+local MAX_PAGES = 5
+local RETRIES = 3
 
-local TTL = 45        -- entry expires if the server stops reporting
-local lastUse = {}
-
--- Every 20s, this server reports its player count
-task.spawn(function()
-    while true do
-        pcall(function()
-            serverMap:SetAsync(game.JobId, {
-                players = #Players:GetPlayers(),
-                max = Players.MaxPlayers,
-            }, TTL)
-        end)
-        task.wait(20)
-    end
-end)
-
--- Remove this server from the list when it shuts down
-game:BindToClose(function()
-    pcall(function()
-        serverMap:RemoveAsync(game.JobId)
+-- Fetch a URL, falling back to the executor's request function if HttpGet fails
+local function fetch(url)
+    local ok, body = pcall(function()
+        return game:HttpGet(url)
     end)
-end)
 
-Players.PlayerRemoving:Connect(function(player)
-    lastUse[player] = nil
-end)
-
-remote.OnServerEvent:Connect(function(player)
-    -- 5 second cooldown per player
-    if lastUse[player] and os.clock() - lastUse[player] < 5 then
-        return
-    end
-    lastUse[player] = os.clock()
-
-    local ok, items = pcall(function()
-        return serverMap:GetRangeAsync(Enum.SortDirection.Ascending, 200)
-    end)
-    if not ok then
-        remote:FireClient(player, "Error, try again")
-        return
+    if ok and body then
+        return body
     end
 
-    local best
-    for _, item in ipairs(items) do
-        local v = item.value
-        if item.key ~= game.JobId and v.players < v.max then
-            if not best or v.players < best.players then
-                best = { id = item.key, players = v.players }
-            end
+    local req = request or http_request or (syn and syn.request)
+    if req then
+        local ok2, res = pcall(req, { Url = url, Method = "GET" })
+        if ok2 and res and res.StatusCode == 200 then
+            return res.Body
         end
     end
 
-    if not best then
-        remote:FireClient(player, "No other server found")
-        return
+    return nil
+end
+
+-- Returns the open server with the fewest players (excluding the current one)
+local function findSmallestServer()
+    local best
+    local cursor = ""
+
+    for _ = 1, MAX_PAGES do
+        local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100"):format(placeId)
+
+        if cursor ~= "" then
+            url = url .. "&cursor=" .. cursor
+        end
+
+        local data
+
+        for attempt = 1, RETRIES do
+            local body = fetch(url)
+
+            if body then
+                local ok, decoded = pcall(function()
+                    return HttpService:JSONDecode(body)
+                end)
+
+                if ok and decoded and decoded.data then
+                    data = decoded
+                    break
+                end
+            end
+
+            task.wait(2 * attempt)
+        end
+
+        if not data then
+            break
+        end
+
+        for _, s in ipairs(data.data) do
+            if s.id ~= currentJob and s.playing < s.maxPlayers then
+                if not best or s.playing < best.playing then
+                    best = s
+                end
+            end
+        end
+
+        -- Results are sorted ascending, so a valid result on this page is the smallest
+        if best then
+            break
+        end
+
+        cursor = data.nextPageCursor
+
+        if not cursor then
+            break
+        end
+
+        task.wait(0.5)
     end
 
-    remote:FireClient(player, ("Joining server (%d players)..."):format(best.players))
+    return best
+end
 
-    local options = Instance.new("TeleportOptions")
-    options.ServerInstanceId = best.id
-    pcall(function()
-        TeleportService:TeleportAsync(game.PlaceId, { player }, options)
+-- Remove any previous copy of the GUI if the script is run again
+local function getGuiParent()
+    local ok, ui = pcall(function()
+        return gethui()
     end)
-end)
 
-------------------------------------------------------------
--- PART 2: LocalScript (StarterGui)
-------------------------------------------------------------
---[[
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Players = game:GetService("Players")
+    if ok and ui then
+        return ui
+    end
 
-local remote = ReplicatedStorage:WaitForChild("JoinSmallestEvent")
+    return game:GetService("CoreGui")
+end
 
-local gui = Instance.new("ScreenGui")
-gui.Name = "SmallestServerJoiner"
-gui.ResetOnSpawn = false
-gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
-
-local button = Instance.new("TextButton")
-button.Size = UDim2.new(0, 220, 0, 50)
-button.Position = UDim2.new(0.5, -110, 0, 20)
-button.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
-button.TextColor3 = Color3.new(1, 1, 1)
-button.Font = Enum.Font.GothamBold
-button.TextSize = 16
-button.Text = "Join Smallest Server"
-button.Parent = gui
-Instance.new("UICorner", button).CornerRadius = UDim.new(0, 10)
-
-button.MouseButton1Click:Connect(function()
-    button.Text = "Searching..."
-    remote:FireServer()
-end)
-
-remote.OnClientEvent:Connect(function(message)
-    button.Text = message
-    task.wait(3)
-    button.Text = "Join Smallest Server"
-end)
-]]
+local parent = getGuiParent()
+local old = parent:FindFirstChild("SmallestServer
